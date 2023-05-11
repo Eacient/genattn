@@ -10,6 +10,16 @@ from core.model.EPSModel import cam_resnet38d
 from core.model.gvae import GMMVAE
 from core.functions.spatialBCE import SpatialBCE
 
+def transform_state_dict(path):
+    cpkt = torch.load(path, map_location='cpu')
+    new_cpkt = {}
+    for k,v in cpkt.items():
+        if 'fc8' not in k:
+            new_cpkt['backbone.'+k]=v
+        else:
+            new_cpkt[k] = v
+    return new_cpkt
+
 def make_prior(cam, cls_label, sp, sal):
     def relu_max_norm(cam, e=1e-5): #to prob but not distribution
         p = F.relu(cam)
@@ -31,16 +41,21 @@ def make_prior(cam, cls_label, sp, sal):
         return feat_c
 
     p = relu_max_norm(cam)
-    p = mean_with_sp(p, sp)
-
-    bg_p = 1-p
-    
     p = p * cls_label.reshape(*cls_label.shape, 1, 1)
-    bg_p = bg_p + (1 - p.max(dim=1,keepdim=True)[0] - bg_p)
-    bg_p = bg_p * cls_label.reshape(*cls_label.shape, 1, 1)
-
+    bg_p = (p > 0) * (1 - p.max(dim=1, keepdim=True)[0])
+    p[p < 0.7] = 0
+    bg_p[bg_p < 0.6] = 0
     prior = torch.cat([p, bg_p], dim=1)
-    prior = prior / (prior.sum(dim=1, keepdim=True) + 1e-8)
+    # p = mean_with_sp(p, sp)
+
+    # bg_p = 1-p
+    
+    # p = p * cls_label.reshape(*cls_label.shape, 1, 1)
+    # bg_p = bg_p + (1 - p.max(dim=1,keepdim=True)[0] - bg_p)
+    # bg_p = bg_p * cls_label.reshape(*cls_label.shape, 1, 1)
+
+    # prior = torch.cat([p, bg_p], dim=1)
+    # prior = prior / (prior.sum(dim=1, keepdim=True) + 1e-8)
 
     return prior #[bs, 2C, h, w]
 
@@ -55,6 +70,11 @@ def make_attn(log_fg_likelihood, cls_label, sp, sal):
     bs, _, h, w = log_fg_likelihood.shape
     log_fg_likelihood = 88 - log_fg_likelihood.max(dim=1,keepdim=True)[0] + log_fg_likelihood
 
+    fg_ind = log_fg_likelihood[:, :20]*cls_label.reshape(*cls_label.shape, 1, 1) > log_fg_likelihood[:, 20:]*cls_label.reshape(*cls_label.shape, 1, 1)
+    fg_pos = torch.any(fg_ind, dim=1, keepdim=True) #[bs, 1, h, w]
+    print(f'binary_fg_ratio={fg_pos.sum()}/{bs*h*w}')
+
+
     fg_likelihood = log_fg_likelihood.exp() #[bs, 2C, h, w]
     fg_likelihood = fg_likelihood.reshape(bs, 2, -1, h, w) #[bs, 2, c, h, w]
     fg_likelihood = fg_likelihood * cls_label.reshape(bs, 1, cls_label.size(1), 1, 1)
@@ -63,6 +83,11 @@ def make_attn(log_fg_likelihood, cls_label, sp, sal):
     fg_likelihood[:, 1] = fg_likelihood[:, 1] + fg_likelihood_sum - fg_likelihood[:, 0] #[bs, 2, c, h, w]
 
     fg_attn = fg_likelihood[:, 0] / fg_likelihood.sum(dim=1) #[bs, c, h, w]
+
+    fg_ind = fg_attn > 0.5
+    fg_pos = torch.any(fg_ind, dim=1, keepdim=True)
+    print(f'fg_ratio={fg_pos.sum()}/{bs*h*w}')
+
 
     return fg_attn
 
@@ -78,7 +103,7 @@ def make_attn_post(fg_post, cls_label, sp, sal):
 
 class Net(nn.Module):
     def __init__(self, num_classes=21, use_bg_prob=False, warmup_cam_net=False, pretrained_cam_net='', m=0.999,
-                 warmup_gvae=False, feat_dim=1024, embed_dim=256, n_cluster=4, use_learnable_mix_ratio=False,
+                 warmup_gvae=False, feat_dim=1024, embed_dim=128, n_cluster=4, use_learnable_mix_ratio=False,
                  approx_prior=True, wta=False):
         super().__init__()
         self.m = m
@@ -87,14 +112,17 @@ class Net(nn.Module):
         self.num_classes = num_classes
         self.cam_net = cam_resnet38d(pretrained=True, use_bg_prob=use_bg_prob, num_classes=num_classes)
         if not warmup_cam_net:
-            self.cam_net.load_state_dict(torch.load(pretrained_cam_net,map_location='cpu'))
+            # self.cam_net.load_state_dict(torch.load(pretrained_cam_net,map_location='cpu'))
+            self.cam_net.load_state_dict(transform_state_dict('pretrained/voc12_cls.pth'))
             gvae_num_classes = num_classes - 1
             self.gvae = GMMVAE(feat_dim, embed_dim, n_cluster, gvae_num_classes,
                             use_learnable_mix_ratio, approx_prior, wta)
 
         if not warmup_cam_net and not warmup_gvae:
             self.prior_net = cam_resnet38d(pretrained=True, use_bg_prob=use_bg_prob, num_classes=num_classes)
-            self.prior_net.load_state_dict(torch.load(pretrained_cam_net,map_location='cpu'))
+            # self.prior_net.load_state_dict(torch.load(pretrained_cam_net,map_location='cpu'))
+            self.cam_net.load_state_dict(transform_state_dict('pretrained/voc12_cls.pth'))
+
 
         self.fix_weights()
 
@@ -138,7 +166,9 @@ class Net(nn.Module):
             prior = make_prior(cam_scores_prior, cls_label, sp, sal)
 
             loss_recon, kl_inner, kl_prior, log_fg_likelihood, fg_post = self.gvae(feat_gvae, prior)
-            # print(loss_recon, kl_inner, kl_prior)
+            # print(f'loss_recon={loss_recon}')
+            # print(f'kl_inner={kl_inner}')
+            # print(f'kl_prior={kl_prior}')
 
             fg_attn = make_attn(log_fg_likelihood, cls_label, sp, sal)
             fg_post = make_attn_post(fg_post, cls_label, sp, sal)
@@ -167,6 +197,8 @@ def gvae_cam(pretrained=False, **kwargs):
     return model
 
 if __name__ == "__main__":
+    from core.misc.utils import setup_seed
+    setup_seed(0)
     from core.data.VOC12Dataset import VOC12Dataset
     ds = VOC12Dataset('metadata/voc12/train_aug.txt', voc12_root='/home/dogglas/mil/datasets/VOC2012',input_size=224)
     img_id, img, label, sal, seg_label, sp = ds[0]
@@ -189,7 +221,7 @@ if __name__ == "__main__":
     # cam_scores_prior, fg_attn, fg_post, loss_generative = model(img, label, sp, sal)
     # print(loss_generative)
 
-    model = Net(warmup_cam_net=False, warmup_gvae=False, approx_prior=True, wta=False)
+    model = Net(warmup_cam_net=False, warmup_gvae=False, approx_prior=False, wta=True)
     model.cam_net.load_state_dict(torch.load('pretrained/cam_net.pth'))
     model.prior_net.load_state_dict(torch.load('pretrained/cam_net.pth'))
     model = model.cuda()

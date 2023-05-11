@@ -84,12 +84,13 @@ class GMMVAE(nn.Module):
         # q(z|x) p(z|c)
         kl_inner1 = guassian_kl(z_mean.unsqueeze(1).unsqueeze(1), z_log_var.unsqueeze(1).unsqueeze(1),
                                  self.mean.unsqueeze(0), self.log_var.unsqueeze(0)) #[bs, C, K]
-        # print(kl_inner1)
+        # print(f'kl_inner1={kl_inner1}')
         # p(c|z) p(c|lambda)
         kl_inner2 = discrete_kl(gmm_post, self.mix_ratio.unsqueeze(0))#[bs, C]
-        # print(kl_inner2)
+        # print(f'kl_inner2={kl_inner2}')
         # print(cls_prob)
-        kl_inner = (kl_inner1 * self.mix_ratio).sum(dim=-1) + kl_inner2 #[bs, C]
+        # print(f'mix_ratio={self.mix_ratio}')
+        kl_inner = (kl_inner1 * gmm_post).sum(dim=-1) + kl_inner2 #[bs, C]
         kl_inner = (kl_inner * cls_prob).sum(dim=-1) #[bs]
         return kl_inner.mean()
 
@@ -142,7 +143,6 @@ if __name__ == "__main__":
 
     gvae = GMMVAE(feat_dim=16, embed_dim=8, n_cluster=2, n_class=3,
                    use_learnable_mix_ratio=False, approx_prior=True, wta=False)
-    
 
 
     x = torch.randn(2, 16, 4, 4) #[bs, dim, h, w]
